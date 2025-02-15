@@ -1,0 +1,736 @@
+create or replace PACKAGE ADMINISTRATOR_PAKIET AS
+
+    -- Deklaracje funkcji
+    FUNCTION pobierz_dostepne_sale(
+        p_id_zajec         IN INTEGER, 
+        p_data_rozpoczecia IN DATE, 
+        p_czas_trwania     IN INTEGER, 
+        p_liczba_miejsc    IN INTEGER
+    ) RETURN DostepneSaleTab PIPELINED;
+
+    FUNCTION pobierz_dostepnych_instruktorow(
+        p_id_sali          IN INTEGER, 
+        p_data_rozpoczecia IN DATE, 
+        p_czas_trwania     IN INTEGER
+    ) RETURN ListaInstruktorowTab PIPELINED;
+
+    FUNCTION oblicz_pensje_instruktora(
+        p_id_instruktora IN INTEGER, 
+        p_data_poczatkowa IN DATE, 
+        p_data_koncowa IN DATE
+    ) RETURN NUMBER;
+
+    FUNCTION najpopularniejsze_zajecia(
+        p_data_od IN DATE, 
+        p_data_do IN DATE
+    ) RETURN TabelaPopularneZajecia;
+
+    -- Deklaracja procedur
+    PROCEDURE AnalizujEfektywnoscInstruktora(
+        p_data_poczatkowa IN DATE,
+        p_data_koncowa    IN DATE
+    );
+    PROCEDURE GenerujRaportWyplat(
+        p_data_poczatkowa IN DATE,
+        p_data_koncowa    IN DATE
+    );
+    PROCEDURE UtworzGrupeZajeciowa(
+        p_id_zajec              IN INTEGER,
+        p_data_rozpoczecia      IN DATE,
+        p_czas_trwania          IN INTEGER,
+        p_liczba_miejsc         IN INTEGER,
+        p_poziom_zaawansowania  IN VARCHAR2
+    );
+    PROCEDURE WyslijPrzypomnienie;
+
+
+END ADMINISTRATOR_PAKIET;
+/
+
+
+create or replace package body "ADMINISTRATOR_PAKIET" as
+
+    FUNCTION pobierz_dostepne_sale( 
+        p_id_zajec         IN INTEGER,
+        p_data_rozpoczecia IN DATE,
+        p_czas_trwania     IN INTEGER,
+        p_liczba_miejsc    IN INTEGER
+    ) RETURN DostepneSaleTab PIPELINED 
+    IS
+    BEGIN
+        FOR sala_rec IN (
+            SELECT s.id_sali, s.pojemnosc, st.nazwa_strefy
+            FROM sala s
+            JOIN dyscyplina_strefa ds ON s.id_strefy = ds.id_strefy
+            JOIN zajecia z ON z.id_dyscypliny = ds.id_dyscypliny
+            JOIN strefa st ON s.id_strefy = st.id_strefy
+            WHERE z.id_zajec = p_id_zajec
+              AND s.pojemnosc >= p_liczba_miejsc
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM grupa_zajeciowa g
+                    WHERE g.sala_id_sali = s.id_sali
+                      AND g.data_rozpoczecia BETWEEN p_data_rozpoczecia  
+                                                 AND p_data_rozpoczecia + (p_czas_trwania / 1440)
+                )
+        ) LOOP
+            PIPE ROW (TypSala(sala_rec.id_sali, sala_rec.pojemnosc, sala_rec.nazwa_strefy));
+        END LOOP;
+
+        -- Obsługa błędu, jeśli nie znaleziono żadnych wyników
+        IF SQL%ROWCOUNT = 0 THEN
+            RETURN;
+        END IF;
+
+        RETURN;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN;
+    END pobierz_dostepne_sale;
+
+
+    FUNCTION pobierz_dostepnych_instruktorow(
+        p_id_sali          IN INTEGER,
+        p_data_rozpoczecia IN DATE,
+        p_czas_trwania     IN INTEGER
+    ) RETURN ListaInstruktorowTab PIPELINED
+    IS
+        v_id_dyscypliny INTEGER;
+    BEGIN
+        -- Jeśli ID sali jest NULL, zwracamy pustą listę instruktorów
+        IF p_id_sali IS NULL THEN
+            RETURN;
+        END IF;
+
+        -- Pobranie ID dyscypliny dla danej sali
+        BEGIN
+            SELECT DISTINCT z.id_dyscypliny
+            INTO v_id_dyscypliny
+            FROM sala s
+            JOIN dyscyplina_strefa ds ON s.id_strefy = ds.id_strefy
+            JOIN zajecia z ON ds.id_dyscypliny = z.id_dyscypliny
+            WHERE s.id_sali = p_id_sali
+            FETCH FIRST 1 ROW ONLY;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                RETURN; -- Zamiast błędu, zwracamy pustą listę instruktorów
+        END;
+
+        -- Pobranie dostępnych instruktorów
+        FOR instr IN (
+            SELECT i.id_instruktora, i.imie, i.nazwisko
+            FROM instruktor i
+            JOIN certyfikat c ON i.id_instruktora = c.instruktor_id_instruktora
+            WHERE c.dyscyplina_id_dyscypliny = v_id_dyscypliny
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM grupa_zajeciowa g
+                  WHERE g.instruktor_id_instruktora = i.id_instruktora
+                    AND (
+                        g.data_rozpoczecia < p_data_rozpoczecia + (p_czas_trwania / 1440)
+                        AND g.data_rozpoczecia + (g.czas_trwania_w_minutach / 1440) > p_data_rozpoczecia
+                    )
+              )
+        ) LOOP
+            PIPE ROW (TypInstruktor(instr.id_instruktora, instr.imie, instr.nazwisko));
+        END LOOP;
+
+        RETURN;
+    END pobierz_dostepnych_instruktorow;
+
+
+    FUNCTION oblicz_pensje_instruktora( 
+        p_id_instruktora IN INTEGER, 
+        p_data_poczatkowa IN DATE, 
+        p_data_koncowa IN DATE 
+    ) RETURN NUMBER IS 
+        v_pensja NUMBER := 0; 
+    BEGIN 
+        -- Obliczenie sumy godzin pracy i pensji
+        SELECT ROUND(NVL(SUM(g.czas_trwania_w_minutach / 60 * i.stawka_za_godzine), 0), 2) 
+        INTO v_pensja 
+        FROM grupa_zajeciowa g 
+        JOIN instruktor i ON g.instruktor_id_instruktora = i.id_instruktora 
+        WHERE g.instruktor_id_instruktora = p_id_instruktora 
+          AND g.data_rozpoczecia BETWEEN p_data_poczatkowa AND p_data_koncowa; 
+
+        RETURN v_pensja; 
+
+    EXCEPTION 
+        WHEN OTHERS THEN 
+            RAISE_APPLICATION_ERROR(-21003, 'Nieoczekiwany błąd: ' || SQLERRM);
+    END oblicz_pensje_instruktora;
+
+
+    FUNCTION najpopularniejsze_zajecia(  
+        p_data_od IN DATE, 
+        p_data_do IN DATE 
+    ) RETURN TabelaPopularneZajecia IS 
+        v_lista_zajec TabelaPopularneZajecia := TabelaPopularneZajecia(); 
+         
+        CURSOR c_zajecia IS 
+            SELECT z.nazwa_zajec, COUNT(r.nr_rezerwacji) AS ilosc_rezerwacji
+            FROM rezerwacja r
+            JOIN grupa_zajeciowa g ON r.grupa_zajeciowa_id_grupy = g.id_grupy
+            JOIN zajecia z ON g.zajecia_id_zajec = z.id_zajec
+            WHERE g.data_rozpoczecia BETWEEN p_data_od AND p_data_do
+            GROUP BY z.nazwa_zajec
+            ORDER BY ilosc_rezerwacji DESC;
+
+    BEGIN 
+        FOR v_record IN c_zajecia LOOP 
+            v_lista_zajec.EXTEND; 
+            v_lista_zajec(v_lista_zajec.LAST) := TypPopularneZajecia( 
+                v_record.nazwa_zajec, 
+                v_record.ilosc_rezerwacji 
+            ); 
+        END LOOP; 
+     
+        RETURN v_lista_zajec; 
+
+    EXCEPTION 
+        WHEN OTHERS THEN 
+            RAISE_APPLICATION_ERROR(-20004, 'Nieoczekiwany błąd: ' || SQLERRM);
+    END najpopularniejsze_zajecia;
+
+    PROCEDURE AnalizujEfektywnoscInstruktora( 
+        p_data_poczatkowa IN DATE, 
+        p_data_koncowa    IN DATE 
+    ) IS 
+    BEGIN 
+        -- Usunięcie starej kolekcji, jeśli istnieje
+        IF APEX_COLLECTION.COLLECTION_EXISTS('EFEKTYWNOSC_INSTRUKTOROW') THEN
+            APEX_COLLECTION.DELETE_COLLECTION('EFEKTYWNOSC_INSTRUKTOROW');
+        END IF;
+
+        -- Tworzenie nowej kolekcji
+        APEX_COLLECTION.CREATE_COLLECTION('EFEKTYWNOSC_INSTRUKTOROW');
+
+        -- Pobranie danych i zapis do kolekcji
+        FOR r IN (
+            SELECT i.id_instruktora, 
+                   i.imie, 
+                   i.nazwisko,  
+                   SUM(NVL(g.liczba_miejsc, 0)) AS liczba_miejsc,
+                   COUNT(rz.nr_rezerwacji) AS liczba_rezerwacji,
+                   CASE 
+                       WHEN SUM(NVL(g.liczba_miejsc, 0)) > 0 
+                       THEN ROUND((COUNT(rz.nr_rezerwacji) / SUM(g.liczba_miejsc)) * 100, 2)
+                       ELSE 0 
+                   END AS procent_oblozenia
+            FROM instruktor i
+            LEFT JOIN grupa_zajeciowa g ON i.id_instruktora = g.instruktor_id_instruktora
+            LEFT JOIN rezerwacja rz ON g.id_grupy = rz.grupa_zajeciowa_id_grupy
+                                    AND rz.status = 'Zarezerwowano'
+            WHERE g.data_rozpoczecia BETWEEN p_data_poczatkowa AND p_data_koncowa
+            GROUP BY i.id_instruktora, i.imie, i.nazwisko
+        ) LOOP
+
+            -- Dodawanie rekordu do kolekcji APEX
+            APEX_COLLECTION.ADD_MEMBER(
+                p_collection_name => 'EFEKTYWNOSC_INSTRUKTOROW',
+                p_c001 => r.id_instruktora,
+                p_c002 => r.imie,
+                p_c003 => r.nazwisko,
+                p_c004 => r.liczba_miejsc,
+                p_c005 => r.liczba_rezerwacji,
+                p_c006 => r.procent_oblozenia
+            );
+        END LOOP;
+
+    EXCEPTION 
+        WHEN OTHERS THEN 
+            RAISE_APPLICATION_ERROR(-25004, ' Nieoczekiwany błąd: ' || SQLERRM); 
+    END AnalizujEfektywnoscInstruktora;
+
+
+    PROCEDURE GenerujRaportWyplat(
+        p_data_poczatkowa IN DATE,
+        p_data_koncowa    IN DATE
+    ) IS
+        v_lista_wyplat WyplatyTab := WyplatyTab();
+        CURSOR c_instruktorzy IS
+            SELECT id_instruktora, imie, nazwisko
+            FROM instruktor;
+        v_kwota NUMBER(10,2);
+    BEGIN
+        -- Przetwarzanie instruktorów
+        FOR r_instruktor IN c_instruktorzy LOOP
+            v_kwota := oblicz_pensje_instruktora(
+                r_instruktor.id_instruktora,
+                p_data_poczatkowa, 
+                p_data_koncowa
+            );
+
+            v_lista_wyplat.EXTEND;
+            v_lista_wyplat(v_lista_wyplat.LAST) := WyplataInstruktora(
+                r_instruktor.id_instruktora, 
+                r_instruktor.imie, 
+                r_instruktor.nazwisko, 
+                v_kwota
+            );
+        END LOOP;
+
+    EXCEPTION 
+        WHEN OTHERS THEN 
+            RAISE_APPLICATION_ERROR(-26005, 'Nieoczekiwany błąd: ' || SQLERRM);
+    END GenerujRaportWyplat;
+
+
+    PROCEDURE UtworzGrupeZajeciowa( 
+        p_id_zajec              IN INTEGER, 
+        p_data_rozpoczecia      IN DATE, 
+        p_czas_trwania          IN INTEGER, 
+        p_liczba_miejsc         IN INTEGER, 
+        p_poziom_zaawansowania  IN VARCHAR2
+    ) IS 
+        -- Zmienne lokalne 
+        v_id_instruktora INTEGER := NULL; 
+        v_id_sali        INTEGER := NULL; 
+
+    BEGIN 
+        -- Pobranie dostępnej sali (jeśli nie ma, nie tworzymy grupy)
+        BEGIN
+            SELECT id_sali 
+            INTO v_id_sali 
+            FROM TABLE(pobierz_dostepne_sale(p_id_zajec, p_data_rozpoczecia, p_czas_trwania, p_liczba_miejsc)) 
+            WHERE ROWNUM = 1; 
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                v_id_sali := NULL;
+        END;
+         
+        -- Pobranie dostępnego instruktora (jeśli nie ma, nie tworzymy grupy)
+        BEGIN
+            SELECT id_instruktora 
+            INTO v_id_instruktora 
+            FROM TABLE(pobierz_dostepnych_instruktorow(v_id_sali, p_data_rozpoczecia, p_czas_trwania)) 
+            WHERE ROWNUM = 1; 
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                v_id_instruktora := NULL;
+        END;
+
+        -- Jeśli nie ma dostępnej sali lub instruktora, kończymy procedurę bez zmian w bazie
+        IF v_id_sali IS NULL OR v_id_instruktora IS NULL THEN
+            RETURN;
+        END IF;
+
+        -- Wstawienie nowej grupy zajęciowej do tabeli 
+        INSERT INTO grupa_zajeciowa ( 
+            id_grupy, data_rozpoczecia, czas_trwania_w_minutach, liczba_miejsc, 
+            poziom_zaawansowania, instruktor_id_instruktora, zajecia_id_zajec, sala_id_sali 
+        ) VALUES ( 
+            grupa_zajeciowa_seq.NEXTVAL,  
+            p_data_rozpoczecia, 
+            p_czas_trwania, 
+            p_liczba_miejsc, 
+            p_poziom_zaawansowania, 
+            v_id_instruktora, 
+            p_id_zajec, 
+            v_id_sali
+        ); 
+
+        COMMIT; -- Zatwierdzamy tylko w razie sukcesu
+
+    EXCEPTION 
+        WHEN OTHERS THEN 
+            ROLLBACK; -- Cofnięcie zmian w razie awarii
+    END UtworzGrupeZajeciowa;
+
+
+    PROCEDURE WyslijPrzypomnienie IS 
+        -- Kolekcja na przypomnienia 
+        v_lista_przypomnien KlientPrzypomnienieTab := KlientPrzypomnienieTab(); 
+
+        -- Zmienne na treść wiadomości
+        v_tresc_email CLOB;
+        v_tytul_email VARCHAR2(200);
+
+        -- Kursor do pobrania klientów z rezerwacjami na jutro 
+        CURSOR c_rezerwacje_jutro IS 
+            SELECT k.id_klienta, k.imie, k.nazwisko, k.email, k.telefon, 
+                   z.nazwa_zajec, g.data_rozpoczecia
+            FROM klient k 
+            JOIN rezerwacja r ON k.id_klienta = r.klient_id_klienta 
+            JOIN grupa_zajeciowa g ON r.grupa_zajeciowa_id_grupy = g.id_grupy 
+            JOIN zajecia z ON g.zajecia_id_zajec = z.id_zajec
+            WHERE TRUNC(g.data_rozpoczecia) = TRUNC(SYSDATE) + 1; 
+
+        -- Kursor do pobrania klientów, których karnet wygasa za 7 dni 
+        CURSOR c_karnety_wygasajace IS 
+            SELECT k.id_klienta, k.imie, k.nazwisko, k.email, k.telefon, z.data_zamowienia
+            FROM klient k 
+            JOIN zamowienia z ON k.id_klienta = z.klient_id_klienta 
+            WHERE TRUNC(z.data_zamowienia) + 30 = TRUNC(SYSDATE) + 7; 
+
+    BEGIN 
+        -- Pobranie klientów z rezerwacjami na jutro 
+        FOR r IN c_rezerwacje_jutro LOOP 
+            -- Treść przypomnienia o zajęciach
+            v_tytul_email := 'Przypomnienie o jutrzejszych zajęciach: ' || r.nazwa_zajec;
+            v_tresc_email := 'Czesc ' || r.imie || ' ' || r.nazwisko || '!,<br><br>' ||
+                             'Przypominamy, że masz rezerwację na zajęcia "<b>' || r.nazwa_zajec || 
+                             '</b>", które odbędą się w dniu ' || TO_CHAR(r.data_rozpoczecia, 'YYYY-MM-DD HH24:MI') || 
+                             '.<br><br>Zapraszamy!';
+
+            -- Wysyłanie e-maila
+            APEX_MAIL.SEND(
+                p_to => r.email,
+                p_from => 'noreply@fitnessclub.com',
+                p_subj => v_tytul_email,
+                p_body => v_tresc_email
+            );
+        END LOOP; 
+
+        -- Pobranie klientów z wygasającym karnetem za 7 dni 
+        FOR r IN c_karnety_wygasajace LOOP 
+            -- Treść przypomnienia o wygasającym karnecie
+            v_tytul_email := 'Twój karnet wkrótce wygaśnie!';
+            v_tresc_email := 'Czesc ' || r.imie || ' ' || r.nazwisko || '!,<br><br>' ||
+                             'Twój karnet wygasa w dniu ' || TO_CHAR(r.data_zamowienia + 30, 'YYYY-MM-DD') || 
+                             '.<br><br>Zapraszamy do odnowienia członkostwa, aby nadal korzystać z zajęć!';
+
+            -- Wysyłanie e-maila
+            APEX_MAIL.SEND(
+                p_to => r.email,
+                p_from => 'noreply@fitnessclub.com',
+                p_subj => v_tytul_email,
+                p_body => v_tresc_email
+            );
+        END LOOP; 
+
+        -- Wymagane, aby e-maile zostały wysłane w APEX
+        APEX_MAIL.PUSH_QUEUE;
+
+    EXCEPTION 
+        WHEN OTHERS THEN 
+            RAISE_APPLICATION_ERROR(-28002, 'Nieoczekiwany błąd: ' || SQLERRM);
+    END WyslijPrzypomnienie;
+
+
+end "ADMINISTRATOR_PAKIET";
+/
+
+
+
+create or replace PACKAGE KLIENT_PAKIET AS
+
+    -- Deklaracje funkcji
+    FUNCTION sprawdz_dostepne_miejsca(
+        p_id_grupy IN grupa_zajeciowa.id_grupy%TYPE
+    ) RETURN INTEGER;
+
+    FUNCTION wyszukaj_zajecia(
+        p_data_poczatkowa IN DATE,
+        p_data_koncowa IN DATE,
+        p_nazwa_zajec IN VARCHAR2 DEFAULT NULL,
+        p_dyscyplina IN VARCHAR2 DEFAULT NULL,
+        p_imie_instruktora IN VARCHAR2 DEFAULT NULL,
+        p_nazwisko_instruktora IN VARCHAR2 DEFAULT NULL,
+        p_poziom_zaawansowania IN VARCHAR2 DEFAULT NULL
+    ) RETURN TypyZajecia.TabelaZajec PIPELINED;
+
+    FUNCTION pobierz_liste_oczekujacych(
+        p_id_grupy IN INTEGER
+    ) RETURN ListaOczekujacychTab;
+
+    FUNCTION pobierz_rezerwacje_klienta(
+        p_id_klienta IN INTEGER
+    ) RETURN RezerwacjaTab PIPELINED;
+
+    -- Deklaracje procedur
+    PROCEDURE ZarezerwujZajecia( 
+        p_id_klienta IN INTEGER, 
+        p_id_grupy   IN INTEGER
+    );
+
+    PROCEDURE AnulujRezerwacje( 
+        p_nr_rezerwacji    IN INTEGER
+    );
+
+    PROCEDURE DodajNaListeOczekujacych( 
+        p_id_klienta IN INTEGER, 
+        p_id_grupy   IN INTEGER,
+        p_wiadomosc OUT VARCHAR2
+    );
+
+    PROCEDURE DodajKlienta( 
+        p_imie           IN VARCHAR2, 
+        p_nazwisko       IN VARCHAR2, 
+        p_plec           IN VARCHAR2, 
+        p_data_urodzenia IN DATE, 
+        p_data_dolaczenia IN DATE, 
+        p_telefon        IN VARCHAR2, 
+        p_email          IN VARCHAR2, 
+        p_adres          IN TypAdres
+    );
+
+END KLIENT_PAKIET;
+/
+
+create or replace PACKAGE BODY KLIENT_PAKIET AS
+
+    FUNCTION sprawdz_dostepne_miejsca( 
+        p_id_grupy IN grupa_zajeciowa.id_grupy%TYPE
+        ) RETURN INTEGER IS
+            v_grupa GrupaInfo;
+        BEGIN
+            -- Pobranie liczby miejsc i zajętych miejsc
+            SELECT GrupaInfo(g.liczba_miejsc, NVL(COUNT(r.nr_rezerwacji), 0))
+            INTO v_grupa
+            FROM grupa_zajeciowa g
+            LEFT JOIN rezerwacja r 
+                ON g.id_grupy = r.grupa_zajeciowa_id_grupy
+                AND r.status = 'Zarezerwowano'
+            WHERE g.id_grupy = p_id_grupy
+            GROUP BY g.liczba_miejsc;
+
+            -- Jeśli liczba miejsc jest NULL, zwracamy NULL zamiast błędu
+            IF v_grupa.liczba_miejsc IS NULL OR v_grupa.liczba_miejsc < 0 THEN
+                RETURN NULL;
+            END IF;
+
+            -- Obliczenie liczby dostępnych miejsc
+            RETURN v_grupa.liczba_miejsc - v_grupa.liczba_rezerwacji;
+
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                RETURN NULL;
+            WHEN OTHERS THEN
+                RETURN NULL;
+    END sprawdz_dostepne_miejsca;          
+
+
+
+    FUNCTION wyszukaj_zajecia(
+        p_data_poczatkowa IN DATE,
+        p_data_koncowa IN DATE,
+        p_nazwa_zajec IN VARCHAR2 DEFAULT NULL,
+        p_dyscyplina IN VARCHAR2 DEFAULT NULL,
+        p_imie_instruktora IN VARCHAR2 DEFAULT NULL,
+        p_nazwisko_instruktora IN VARCHAR2 DEFAULT NULL,
+        p_poziom_zaawansowania IN VARCHAR2 DEFAULT NULL
+    ) RETURN TypyZajecia.TabelaZajec PIPELINED
+    IS
+    BEGIN
+        -- Pobieranie wyników i zwracanie rekordów w PIPELINED
+        FOR rec IN (
+            SELECT g.id_grupy, g.data_rozpoczecia, g.czas_trwania_w_minutach AS czas_trwania,
+                   z.nazwa_zajec, d.nazwa_dyscypliny, i.imie, i.nazwisko, g.poziom_zaawansowania
+            FROM grupa_zajeciowa g
+            JOIN zajecia z ON g.zajecia_id_zajec = z.id_zajec
+            JOIN dyscyplina d ON z.id_dyscypliny = d.id_dyscypliny
+            JOIN instruktor i ON g.instruktor_id_instruktora = i.id_instruktora
+            WHERE g.data_rozpoczecia BETWEEN p_data_poczatkowa AND p_data_koncowa
+              AND (p_nazwa_zajec IS NULL OR z.nazwa_zajec = p_nazwa_zajec)
+              AND (p_dyscyplina IS NULL OR d.nazwa_dyscypliny = p_dyscyplina)
+              AND (p_imie_instruktora IS NULL OR i.imie = p_imie_instruktora)
+              AND (p_nazwisko_instruktora IS NULL OR i.nazwisko = p_nazwisko_instruktora)
+              AND (p_poziom_zaawansowania IS NULL OR g.poziom_zaawansowania = p_poziom_zaawansowania)
+        ) LOOP
+            PIPE ROW (TypyZajecia.TypZajecia(
+                rec.id_grupy, rec.data_rozpoczecia, rec.czas_trwania,
+                rec.nazwa_zajec, rec.nazwa_dyscypliny, rec.imie, rec.nazwisko, rec.poziom_zaawansowania
+            ));
+        END LOOP;
+
+        RETURN;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RETURN;
+        WHEN OTHERS THEN
+            RETURN;
+    END wyszukaj_zajecia;
+
+
+    FUNCTION pobierz_liste_oczekujacych(
+        p_id_grupy IN INTEGER
+    ) RETURN ListaOczekujacychTab IS
+        v_lista ListaOczekujacychTab := ListaOczekujacychTab();
+    BEGIN
+        -- Pobranie listy oczekujących
+        SELECT ListaOczekujacychObj(k.id_klienta, k.imie, k.nazwisko, r.status)
+        BULK COLLECT INTO v_lista
+        FROM rezerwacja r
+        JOIN klient k ON r.klient_id_klienta = k.id_klienta
+        WHERE r.grupa_zajeciowa_id_grupy = p_id_grupy AND r.status = 'Oczekujący';
+
+        RETURN v_lista;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN v_lista;
+    END pobierz_liste_oczekujacych;
+
+
+
+    FUNCTION pobierz_rezerwacje_klienta(
+        p_id_klienta IN INTEGER
+    ) RETURN RezerwacjaTab PIPELINED IS
+    BEGIN
+        FOR rec IN (
+            SELECT r.nr_rezerwacji, r.data_rezerwacji, r.status,
+                   g.data_rozpoczecia, g.czas_trwania_w_minutach,
+                   z.nazwa_zajec, g.poziom_zaawansowania
+            FROM rezerwacja r
+            JOIN grupa_zajeciowa g ON r.grupa_zajeciowa_id_grupy = g.id_grupy
+            JOIN zajecia z ON g.zajecia_id_zajec = z.id_zajec
+            WHERE r.klient_id_klienta = p_id_klienta
+        ) LOOP
+            PIPE ROW (RezerwacjaTyp(
+                rec.nr_rezerwacji, rec.data_rezerwacji, rec.status,
+                rec.data_rozpoczecia, rec.czas_trwania_w_minutach,
+                rec.nazwa_zajec, rec.poziom_zaawansowania
+            ));
+        END LOOP;
+
+        RETURN;
+    END pobierz_rezerwacje_klienta;
+
+
+    PROCEDURE ZarezerwujZajecia( 
+        p_id_klienta IN INTEGER, 
+        p_id_grupy   IN INTEGER
+    ) IS 
+        v_status_rezerwacji VARCHAR2(20) := 'Zarezerwowano'; 
+
+    BEGIN 
+        -- Dodanie rezerwacji do tabeli REZERWACJA 
+        INSERT INTO rezerwacja (nr_rezerwacji, data_rezerwacji, klient_id_klienta, grupa_zajeciowa_id_grupy, status) 
+        VALUES (rezerwacja_seq.NEXTVAL, SYSDATE, p_id_klienta, p_id_grupy, v_status_rezerwacji); 
+
+        -- Zatwierdzenie transakcji 
+        COMMIT; 
+
+    EXCEPTION 
+        WHEN OTHERS THEN 
+            apex_error.add_error(
+                p_message => 'Nieoczekiwany błąd: ' || SQLERRM,
+                p_display_location => apex_error.c_inline_in_notification
+            );
+            ROLLBACK;
+    END ZarezerwujZajecia;
+
+
+    PROCEDURE AnulujRezerwacje(
+        p_nr_rezerwacji IN INTEGER
+    ) IS
+    BEGIN
+        -- Aktualizacja statusu rezerwacji na 'Anulowano'
+        UPDATE rezerwacja 
+        SET status = 'Anulowano'
+        WHERE nr_rezerwacji = p_nr_rezerwacji;
+
+        -- Zatwierdzenie transakcji tylko, jeśli coś zostało zaktualizowane
+        IF SQL%ROWCOUNT > 0 THEN
+            COMMIT;
+        END IF;
+    END AnulujRezerwacje;
+
+
+
+    PROCEDURE DodajNaListeOczekujacych(
+        p_id_klienta IN INTEGER,
+        p_id_grupy   IN INTEGER,
+        p_wiadomosc  OUT VARCHAR2 
+    ) IS
+        v_dostepne_miejsca INTEGER;
+        v_lista_oczek ListaOczekujacychTab;
+        v_istnieje INTEGER;
+    BEGIN
+        -- Sprawdzenie dostępnych miejsc
+        v_dostepne_miejsca := sprawdz_dostepne_miejsca(p_id_grupy);
+
+        IF v_dostepne_miejsca > 0 THEN
+            -- Jeśli są dostępne miejsca, dokonaj rezerwacji
+            ZarezerwujZajecia(p_id_klienta, p_id_grupy);
+            p_wiadomosc := 'Rezerwacja zakończona pomyślnie! Klient został zapisany na zajęcia.';
+            RETURN;
+        END IF;
+
+        -- Dodanie klienta na listę oczekujących
+        INSERT INTO rezerwacja (nr_rezerwacji, data_rezerwacji, klient_id_klienta, grupa_zajeciowa_id_grupy, status) 
+        VALUES (rezerwacja_seq.NEXTVAL, SYSDATE, p_id_klienta, p_id_grupy, 'Oczekujący');
+
+        p_wiadomosc := 'Brak miejsc w grupie zajęciowej. Klient został dodany na listę oczekujących.';
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            p_wiadomosc := 'Błąd: ' || SQLERRM;
+    END DodajNaListeOczekujacych;
+   
+
+    PROCEDURE DodajKlienta( 
+        p_imie           IN VARCHAR2, 
+        p_nazwisko       IN VARCHAR2, 
+        p_plec           IN VARCHAR2, 
+        p_data_urodzenia IN DATE, 
+        p_data_dolaczenia IN DATE, 
+        p_telefon        IN VARCHAR2, 
+        p_email          IN VARCHAR2, 
+        p_adres          IN TypAdres
+    ) IS 
+        v_id_adresu INTEGER := NULL; 
+        v_count INTEGER := 0; 
+    BEGIN 
+        -- Sprawdzenie, czy kod pocztowy już istnieje, jeśli nie, dodajemy
+        BEGIN
+            SELECT COUNT(*) INTO v_count 
+            FROM kod_pocztowy 
+            WHERE kod_pocztowy = p_adres.kod_pocztowy;
+
+            IF v_count = 0 THEN 
+                INSERT INTO kod_pocztowy (kod_pocztowy, miasto) 
+                VALUES (p_adres.kod_pocztowy, p_adres.miasto);
+            END IF; 
+
+        EXCEPTION
+            WHEN DUP_VAL_ON_INDEX THEN 
+                NULL; -- Ignorujemy błąd, jeśli kod pocztowy już istnieje
+        END;
+
+        -- Sprawdzenie, czy adres już istnieje
+        BEGIN
+            SELECT id_adresu INTO v_id_adresu 
+            FROM adres 
+            WHERE ulica = p_adres.ulica 
+              AND nr_domu = p_adres.nr_domu 
+              AND NVL(nr_mieszkania, 0) = NVL(p_adres.nr_mieszkania, 0) 
+              AND kod_pocztowy_kod_pocztowy = p_adres.kod_pocztowy;
+
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                -- Jeśli adres nie istnieje, dodajemy nowy
+                SELECT NVL(MAX(id_adresu), 0) + 1 INTO v_id_adresu FROM adres; 
+                INSERT INTO adres (id_adresu, ulica, nr_domu, nr_mieszkania, kod_pocztowy_kod_pocztowy) 
+                VALUES (v_id_adresu, p_adres.ulica, p_adres.nr_domu, p_adres.nr_mieszkania, p_adres.kod_pocztowy);
+        END;
+
+        -- Dodanie nowego klienta
+        INSERT INTO klient (id_klienta, imie, nazwisko, plec, data_urodzenia, data_dolaczenia, adres_id_adresu, telefon, email) 
+        VALUES ( 
+            klient_seq.NEXTVAL, 
+            p_imie, 
+            p_nazwisko, 
+            p_plec, 
+            p_data_urodzenia, 
+            p_data_dolaczenia, 
+            v_id_adresu, 
+            p_telefon, 
+            p_email
+        );  
+
+        COMMIT; -- Zatwierdzenie transakcji tylko w razie sukcesu
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK; -- Jeśli wystąpił błąd, cofamy zmiany
+            RAISE_APPLICATION_ERROR(-20099, 'Błąd: ' || SQLERRM);
+    END DodajKlienta;
+
+
+END KLIENT_PAKIET;
+/
