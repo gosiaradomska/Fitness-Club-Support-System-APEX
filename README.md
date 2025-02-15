@@ -6,20 +6,20 @@ This project is a continuation of the [Fitness Club Support System - Database](h
 The aim was to build an Oracle APEX application that enables system administrators and receptionists to manage fitness club operations and client data.
 
 ### Project Files
-* **[Report (PDF):]** Contains procedure and function diagrams, scripts, and implementation details of the APEX application.
-* **[PL/SQL Scripts:]** Database functions, procedures, and triggers.
-* **[APEX Implementation:]** Application export for deployment in Oracle APEX.
+* **[Report (PDF):](Radomska_Rapa_AB_Projekt.pdf)** Contains procedure and function diagrams, scripts, and implementation details of the APEX application.
+* **[PL/SQL Scripts:](Radomska_Rapa_pakiety.txt)** Database functions, procedures, and triggers.
+* **[APEX Implementation:](f100(8).sql)** Application export for deployment in Oracle APEX.
 
 ## Features
 
-# Client Management
+### Client Management
 * Adding new clients.
 * Searching for available classes and booking them for clients.
 * Adding clients to a waiting list if no spots are available.
 * Checking and canceling client reservations.
 * Sending reminders for upcoming classes and membership expiration.
   
-# Club Management
+### Club Management
 * Adding new class groups.
 * Displaying the class schedule in a calendar format.
 * Generating:
