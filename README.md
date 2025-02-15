@@ -27,7 +27,7 @@ The aim was to build an Oracle APEX application that enables system administrato
   * Instructor efficiency reports.
   * Charts of the most popular classes.
  
-# Technologies Used
+## Technologies Used
 * **Oracle APEX** – Web-based application development.
 * **PL/SQL** – Database logic and procedures.
 * **Oracle Database** – Data storage and management.
